@@ -83,6 +83,22 @@
  */
 static struct smb2_context *active_contexts;
 
+/* active_contexts is process-global; contexts may be created and destroyed
+ * from different threads concurrently (one context per thread is the
+ * documented model), so every access to the list must be serialized.
+ * SMB2_LIST_REMOVE temporarily rewrites the list head while walking it,
+ * which corrupts the list (and can make it cyclic) without a lock.
+ */
+#if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+#include <pthread.h>
+static pthread_mutex_t active_contexts_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define ACTIVE_CONTEXTS_LOCK()   pthread_mutex_lock(&active_contexts_mutex)
+#define ACTIVE_CONTEXTS_UNLOCK() pthread_mutex_unlock(&active_contexts_mutex)
+#else
+#define ACTIVE_CONTEXTS_LOCK()   do { } while (0)
+#define ACTIVE_CONTEXTS_UNLOCK() do { } while (0)
+#endif
+
 static int
 smb2_parse_args(struct smb2_context *smb2, const char *args)
 {
@@ -302,7 +318,9 @@ struct smb2_context *smb2_init_context(void)
 
         smb2->session_key = NULL;
 
+        ACTIVE_CONTEXTS_LOCK();
         SMB2_LIST_ADD(&active_contexts, smb2);
+        ACTIVE_CONTEXTS_UNLOCK();
 
         return smb2;
 }
@@ -389,7 +407,9 @@ void smb2_destroy_context(struct smb2_context *smb2)
             free_c_data(smb2, smb2->connect_data);  /* sets smb2->connect_data to NULL */
         }
 
+        ACTIVE_CONTEXTS_LOCK();
         SMB2_LIST_REMOVE(&active_contexts, smb2);
+        ACTIVE_CONTEXTS_UNLOCK();
         free(smb2);
 }
 
@@ -400,15 +420,18 @@ struct smb2_context *smb2_active_contexts(void)
 
 int smb2_context_active(struct smb2_context *smb2)
 {
-        struct smb2_context *context = active_contexts;
+        struct smb2_context *context;
+        int found = 0;
 
-        while (context) {
+        ACTIVE_CONTEXTS_LOCK();
+        for (context = active_contexts; context; context = context->next) {
                 if (smb2 == context) {
-                        return 1;
+                        found = 1;
+                        break;
                 }
-                context = context->next;
         }
-        return 0;
+        ACTIVE_CONTEXTS_UNLOCK();
+        return found;
 }
 
 void smb2_free_iovector(struct smb2_context *smb2, struct smb2_io_vectors *v)
