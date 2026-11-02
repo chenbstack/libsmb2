@@ -315,8 +315,21 @@ decode_dirents(struct smb2_context *smb2, struct smb2dir *dir,
                 tmp_vec.buf = &vec->buf[offset];
                 tmp_vec.len = vec->len - offset;
 
-                smb2_decode_fileidfulldirectoryinformation(smb2, &fs,
-                                                           &tmp_vec);
+                /* velum: never use fields of an entry that failed to decode,
+                 * and make sure the next entry offset moves forward inside
+                 * the reply.
+                 */
+                memset(&fs, 0, sizeof(fs));
+                if (smb2_decode_fileidfulldirectoryinformation(smb2, &fs,
+                                                               &tmp_vec) < 0) {
+                        return -1;
+                }
+                if (fs.next_entry_offset != 0 &&
+                    fs.next_entry_offset >= vec->len - offset) {
+                        free(discard_const(fs.name));
+                        smb2_set_error(smb2, "Malformed query reply.");
+                        return -1;
+                }
                 /* steal the name */
                 ent->dirent.name = fs.name;
                 ent->dirent.st.smb2_type = SMB2_TYPE_FILE;

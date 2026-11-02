@@ -59,8 +59,17 @@ smb2_decode_fileidfulldirectoryinformation(
     struct smb2_fileidfulldirectoryinformation *fs,
     struct smb2_iovec *vec)
 {
-        uint32_t name_len;
+        uint32_t name_len = 0;
         uint64_t t;
+
+        /* velum: the fixed part is 80 bytes; reject shorter entries before
+         * reading any field (smb2_get_uint32 fails on short vectors and
+         * would leave name_len uninitialized).
+         */
+        if (vec->len < 80) {
+                smb2_set_error(smb2, "Malformed query reply.\n");
+                return -1;
+        }
 
         /* Make sure the name fits before end of vector.
          * As the name is the final part of this blob this guarantees

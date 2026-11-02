@@ -911,6 +911,13 @@ dcerpc_carray_coder(struct dcerpc_context *ctx,
         carray->max_count = p;
 
         if (dcerpc_pdu_direction(pdu) == DCERPC_DECODE) {
+                /* velum: every element takes at least one byte on the wire;
+                 * a larger count is malformed and could overflow the
+                 * allocation size below.
+                 */
+                if (carray->max_count > iov->len) {
+                        return -1;
+                }
                 if (carray->max_count && carray->data == NULL) {
                         carray->data = smb2_alloc_data(
                                 dcerpc_get_smb2_context(ctx),
@@ -1042,7 +1049,9 @@ dcerpc_decode_utf16(struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
         }
         
         /* Data part */
-        if (*offset + s->actual_count * 2 > iov->len) {
+        /* velum: overflow-safe bounds check (offset + 2 * actual_count could wrap). */
+        if (*offset < 0 || (size_t)*offset > iov->len ||
+            (uint64_t)s->actual_count > ((uint64_t)iov->len - (uint64_t)*offset) / 2) {
                 return -1;
         }
         if (!(pdu->hdr.packed_drep[0] & DCERPC_DR_LITTLE_ENDIAN)) {
@@ -1340,6 +1349,10 @@ dcerpc_bind_ack_coder(struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
         if (dcerpc_uint8_coder(ctx, pdu, iov, offset, &bind_ack->num_results)) {
                 return -1;
         }
+        /* velum: results[] only holds MAX_ACK_RESULTS entries. */
+        if (bind_ack->num_results > MAX_ACK_RESULTS) {
+                return -1;
+        }
         *offset += 3;
 
         for (i = 0; i < bind_ack->num_results; i++) {
@@ -1475,13 +1488,19 @@ dce_unfragment_ioctl(struct dcerpc_context *dce,  struct dcerpc_pdu *pdu,
                 return;
         }
 
+        /* velum: fragment lengths come from the server; keep every copy
+         * inside the buffer.
+         */
+        if (hdr.frag_length < 24 || hdr.frag_length > iov->len) {
+                return;
+        }
         offset += hdr.frag_length;
         unfragment_len = hdr.frag_length;
         do {
                 /* We must have at least a DCERPC header plus a
                  * RESPONSE header
                  */
-                if (iov->len - offset < 24) {
+                if ((size_t)offset > iov->len || iov->len - offset < 24) {
                         return;
                 }
 
@@ -1489,6 +1508,10 @@ dce_unfragment_ioctl(struct dcerpc_context *dce,  struct dcerpc_pdu *pdu,
                 tmpiov.len = iov->len - offset;
                 o = 0;
                 if (dcerpc_header_coder(dce, pdu, &tmpiov, &o, &next_hdr)) {
+                        return;
+                }
+                if (next_hdr.frag_length < 24 ||
+                    next_hdr.frag_length > iov->len - offset) {
                         return;
                 }
 
