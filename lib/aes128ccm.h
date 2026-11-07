@@ -21,6 +21,17 @@ void aes128ccm_encrypt(unsigned char *key,
 		       unsigned char *p, size_t plen,
 		       unsigned char *m, size_t mlen);
 
+/* velum: 通用 CCM：klen 为 16 或 32；返回 0 成功，解密时标签不符返回 -1。 */
+int smb3_aes_ccm_encrypt(const unsigned char *key, size_t klen,
+                         unsigned char *nonce, size_t nlen,
+                         unsigned char *aad, size_t alen,
+                         unsigned char *p, size_t plen,
+                         unsigned char *m, size_t mlen);
+int smb3_aes_ccm_decrypt(const unsigned char *key, size_t klen,
+                         unsigned char *nonce, size_t nlen,
+                         unsigned char *aad, size_t alen,
+                         unsigned char *p, size_t plen,
+                         unsigned char *m, size_t mlen);
 int aes128ccm_decrypt(unsigned char *key,
 		      unsigned char *nonce, size_t nlen,
 		      unsigned char *aad, size_t alen,

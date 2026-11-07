@@ -56,6 +56,7 @@
 #include "smb2.h"
 #include "libsmb2.h"
 #include "libsmb2-private.h"
+#include "smb3-seal.h"
 
 static int
 smb2_encode_preauth_context(struct smb2_context *smb2, struct smb2_pdu *pdu)
@@ -88,13 +89,14 @@ smb2_encode_preauth_context(struct smb2_context *smb2, struct smb2_pdu *pdu)
 }
 
 static int
-smb2_encode_encryption_context(struct smb2_context *smb2, struct smb2_pdu *pdu)
+smb2_encode_encryption_context(struct smb2_context *smb2, struct smb2_pdu *pdu,
+                               const uint16_t *ciphers, int count)
 {
         uint8_t *buf;
-        int len, data_len;
+        int i, len, data_len;
         struct smb2_iovec *iov;
 
-        data_len = PAD_TO_64BIT(4);
+        data_len = 2 + 2 * count;
         len = 8 + data_len;
         len = PAD_TO_64BIT(len);
         buf = malloc(len);
@@ -107,8 +109,10 @@ smb2_encode_encryption_context(struct smb2_context *smb2, struct smb2_pdu *pdu)
         iov = smb2_add_iovector(smb2, &pdu->out, buf, len, free);
         smb2_set_uint16(iov, 0, SMB2_ENCRYPTION_CAP);
         smb2_set_uint16(iov, 2, data_len);
-        smb2_set_uint16(iov, 8, 1);
-        smb2_set_uint16(iov, 10, SMB2_ENCRYPTION_AES_128_CCM);
+        smb2_set_uint16(iov, 8, count);
+        for (i = 0; i < count; i++) {
+                smb2_set_uint16(iov, 10 + 2 * i, ciphers[i]);
+        }
 
         return 0;
 }
@@ -144,6 +148,9 @@ smb2_encode_negotiate_request(struct smb2_context *smb2,
         if (smb2->version == SMB2_VERSION_ANY ||
             smb2->version == SMB2_VERSION_ANY3 ||
             smb2->version == SMB2_VERSION_0311) {
+                uint16_t ciphers[4];
+                int ncipher = smb3_client_ciphers(ciphers);
+
                 req->negotiate_context_offset = len + SMB2_HEADER_SIZE;
 
                 if (smb2_encode_preauth_context(smb2, pdu)) {
@@ -151,7 +158,7 @@ smb2_encode_negotiate_request(struct smb2_context *smb2,
                 }
                 req->negotiate_context_count++;
 
-                if (smb2_encode_encryption_context(smb2, pdu)) {
+                if (smb2_encode_encryption_context(smb2, pdu, ciphers, ncipher)) {
                         return -1;
                 }
                 req->negotiate_context_count++;
@@ -249,7 +256,8 @@ smb2_encode_negotiate_reply(struct smb2_context *smb2,
                 }
                 rep->negotiate_context_count++;
 
-                if (smb2_encode_encryption_context(smb2, pdu)) {
+                static const uint16_t ccm = SMB2_ENCRYPTION_AES_128_CCM;
+                if (smb2_encode_encryption_context(smb2, pdu, &ccm, 1)) {
                         return -1;
                 }
                 rep->negotiate_context_count++;
@@ -310,7 +318,15 @@ smb2_parse_encryption_context(struct smb2_context *smb2,
                               struct smb2_iovec *iov,
                               int offset)
 {
-        smb2_get_uint16(iov, offset, &rep->cypher);
+        uint16_t count;
+
+        /* velum: 数据区：CipherCount(2) + Ciphers；服务器只回选中的一个 */
+        smb2_get_uint16(iov, offset, &count);
+        if (count != 1) {
+                smb2_set_error(smb2, "Bad cipher count %d in encryption context", count);
+                return -1;
+        }
+        smb2_get_uint16(iov, offset + 2, &rep->cypher);
         return 0;
 }
 

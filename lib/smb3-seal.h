@@ -36,6 +36,12 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
 int
 smb3_decrypt_pdu(struct smb2_context *smb2);
 
+/* velum: 本端能用的加密算法：返回密钥长度（16/32），不支持返回 0。 */
+int smb3_cipher_key_len(uint16_t cipher);
+
+/* velum: 客户端按偏好顺序通告的算法；返回个数（最多 4）。 */
+int smb3_client_ciphers(uint16_t ciphers[4]);
+
 #ifdef __cplusplus
 }
 #endif

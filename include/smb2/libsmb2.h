@@ -1372,6 +1372,21 @@ int smb2_serve_port_async(const int fd, const int to_msecs, struct smb2_context 
 int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_client_connection cb, void *cb_data);
 
 /*
+ * velum: AES-GCM 实现回调（SMB 3.1.1 加密）。libsmb2 自身不带 GCM，由调用方注册
+ * （Velum 的 SMBClient 用 CryptoKit）。未注册时协商只通告 CCM。
+ *
+ * key/key_len：16 或 32 字节；nonce：12 字节；aad：SMB2 传输头第 20–51 字节。
+ * data 原地加密 / 解密 len 字节；tag 为 16 字节标签（加密时写出，解密时校验）。
+ * 返回 0 成功；解密时标签不符或出错返回非 0。
+ */
+typedef int (*smb2_gcm_fn)(const uint8_t *key, size_t key_len,
+                           const uint8_t *nonce,
+                           const uint8_t *aad, size_t aad_len,
+                           uint8_t *data, size_t len,
+                           uint8_t *tag);
+void smb2_set_gcm_impl(smb2_gcm_fn encrypt, smb2_gcm_fn decrypt);
+
+/*
  * Some symbols have moved over to a different header file to allow better
  * separation between dcerpc and smb2, so we need to include this header
  * here to retain compatibility for apps that depend on those symbols.

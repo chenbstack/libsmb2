@@ -103,6 +103,7 @@ smb2_set_passthrough
 smb2_set_password
 smb2_set_password_from_file
 smb2_set_domain
+smb2_set_gcm_impl
 smb2_set_error
 smb2_set_tree_id_for_pdu
 smb2_set_workstation

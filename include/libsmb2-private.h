@@ -50,6 +50,8 @@ extern "C" {
 
 #define SMB2_SIGNATURE_SIZE 16
 #define SMB2_KEY_SIZE 16
+/* velum: 加密密钥最长 32 字节（AES-256-CCM / AES-256-GCM） */
+#define SMB2_CIPHER_KEY_MAX 32
 
 #define SMB2_MAX_VECTORS 256
 
@@ -181,8 +183,8 @@ struct smb2_context {
         uint8_t seal:1;
         uint8_t sign:1;
         uint8_t signing_key[SMB2_KEY_SIZE];
-        uint8_t serverin_key[SMB2_KEY_SIZE];
-        uint8_t serverout_key[SMB2_KEY_SIZE];
+        uint8_t serverin_key[SMB2_CIPHER_KEY_MAX];
+        uint8_t serverout_key[SMB2_CIPHER_KEY_MAX];
         uint8_t salt[SMB2_SALT_SIZE];
         uint16_t cypher;
         uint8_t preauthhash[SMB2_PREAUTH_HASH_SIZE];

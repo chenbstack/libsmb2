@@ -67,20 +67,96 @@
 
 static const char xfer[4] = {0xFD, 'S', 'M', 'B'};
 
+static smb2_gcm_fn gcm_encrypt;
+static smb2_gcm_fn gcm_decrypt;
+
+void smb2_set_gcm_impl(smb2_gcm_fn encrypt, smb2_gcm_fn decrypt)
+{
+        gcm_encrypt = encrypt;
+        gcm_decrypt = decrypt;
+}
+
+static int cipher_is_gcm(uint16_t cipher)
+{
+        return cipher == SMB2_ENCRYPTION_AES_128_GCM ||
+               cipher == SMB2_ENCRYPTION_AES_256_GCM;
+}
+
+int smb3_cipher_key_len(uint16_t cipher)
+{
+        switch (cipher) {
+        case SMB2_ENCRYPTION_AES_128_CCM:
+                return 16;
+        case SMB2_ENCRYPTION_AES_128_GCM:
+                return gcm_encrypt && gcm_decrypt ? 16 : 0;
+#ifdef __APPLE__
+        /* velum: AES-256-CCM 依赖 CommonCrypto 版的 CCM，参考实现只有 AES-128 */
+        case SMB2_ENCRYPTION_AES_256_CCM:
+                return 32;
+#endif
+        case SMB2_ENCRYPTION_AES_256_GCM:
+                return gcm_encrypt && gcm_decrypt ? 32 : 0;
+        default:
+                return 0;
+        }
+}
+
+int smb3_client_ciphers(uint16_t ciphers[4])
+{
+        /* velum: GCM 优先（硬件加速、只需一遍）；CCM 兜底，SMB 3.0 / 3.0.2 也只有 CCM */
+        static const uint16_t preferred[4] = {
+                SMB2_ENCRYPTION_AES_128_GCM, SMB2_ENCRYPTION_AES_128_CCM,
+                SMB2_ENCRYPTION_AES_256_GCM, SMB2_ENCRYPTION_AES_256_CCM,
+        };
+        int i, n = 0;
+
+        for (i = 0; i < 4; i++) {
+                if (smb3_cipher_key_len(preferred[i])) {
+                        ciphers[n++] = preferred[i];
+                }
+        }
+        return n;
+}
+
+/* velum: SMB 3.0 / 3.0.2 没有协商上下文，算法固定为 AES-128-CCM */
+static uint16_t effective_cipher(struct smb2_context *smb2)
+{
+        return smb2->cypher ? smb2->cypher : SMB2_ENCRYPTION_AES_128_CCM;
+}
+
+static void fill_nonce(uint8_t *buf, size_t len)
+{
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        arc4random_buf(buf, len);
+#else
+        size_t i;
+        for (i = 0; i < len; i++) {
+                buf[i] = random() & 0xff;
+        }
+#endif
+}
+
 int
 smb3_encrypt_pdu(struct smb2_context *smb2,
                  struct smb2_pdu *pdu)
 {
         struct smb2_pdu *tmp_pdu;
         uint32_t spl, u32;
-        int i;
-        uint16_t u16;
+        int i, rc, klen;
+        uint16_t u16, cipher;
 
         if (!smb2->seal) {
                 return 0;
         }
         if (!pdu->seal) {
                 return 0;
+        }
+        cipher = effective_cipher(smb2);
+        klen = smb3_cipher_key_len(cipher);
+        if (klen == 0) {
+                smb2_set_error(smb2, "Unsupported SMB3 encryption algorithm 0x%04x", cipher);
+                pdu->seal = 0;
+                return -1;
         }
 
         spl = 52;  /* transform header */
@@ -96,11 +172,11 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
         }
 
         memcpy(&pdu->crypt[0], xfer, 4);
-        for (i = 20; i < 31; i++) {
-                pdu->crypt[i] = random()&0xff;
-        }
+        /* velum: Nonce 字段 16 字节：CCM 用前 11 字节、GCM 用前 12 字节，其余为 0 */
+        fill_nonce(&pdu->crypt[20], cipher_is_gcm(cipher) ? 12 : 11);
         u32 = htole32(spl - 52);
         memcpy(&pdu->crypt[36], &u32, 4);
+        /* velum: 3.0 / 3.0.2 为 EncryptionAlgorithm（CCM=1），3.1.1 为 Flags（Encrypted=1），值相同 */
         u16 = htole16(SMB_ENCRYPTION_AES128_CCM);
         memcpy(&pdu->crypt[42], &u16, 2);
         memcpy(&pdu->crypt[44], &smb2->session_id, 8);
@@ -114,11 +190,26 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
                 }
         }
 
-        aes128ccm_encrypt(smb2->serverin_key,
-                          &pdu->crypt[20], 11,
-                          &pdu->crypt[20], 32,
-                          &pdu->crypt[52], spl - 52,
-                          &pdu->crypt[4], 16);
+        if (cipher_is_gcm(cipher)) {
+                rc = gcm_encrypt(smb2->serverin_key, klen,
+                                 &pdu->crypt[20],
+                                 &pdu->crypt[20], 32,
+                                 &pdu->crypt[52], spl - 52,
+                                 &pdu->crypt[4]);
+        } else {
+                rc = smb3_aes_ccm_encrypt(smb2->serverin_key, klen,
+                                          &pdu->crypt[20], 11,
+                                          &pdu->crypt[20], 32,
+                                          &pdu->crypt[52], spl - 52,
+                                          &pdu->crypt[4], 16);
+        }
+        if (rc) {
+                smb2_set_error(smb2, "Failed to encrypt PDU");
+                free(pdu->crypt);
+                pdu->crypt = NULL;
+                pdu->seal = 0;
+                return -1;
+        }
         pdu->crypt_len = spl;
 
         return 0;
@@ -127,14 +218,27 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
 int
 smb3_decrypt_pdu(struct smb2_context *smb2)
 {
-        int rc;
+        int rc, klen;
+        uint16_t cipher = effective_cipher(smb2);
+        uint8_t *hdr = smb2->in.iov[smb2->in.niov - 2].buf;
+        uint8_t *data = smb2->in.iov[smb2->in.niov - 1].buf;
+        size_t len = smb2->in.iov[smb2->in.niov - 1].len;
 
-        if (aes128ccm_decrypt(smb2->serverout_key,
-                              &smb2->in.iov[smb2->in.niov - 2].buf[20], 11,
-                              &smb2->in.iov[smb2->in.niov - 2].buf[20], 32,
-                              &smb2->in.iov[smb2->in.niov - 1].buf[0],
-                              smb2->in.iov[smb2->in.niov - 1].len,
-                              &smb2->in.iov[smb2->in.niov - 2].buf[4], 16)) {
+        klen = smb3_cipher_key_len(cipher);
+        if (klen == 0) {
+                smb2_set_error(smb2, "Unsupported SMB3 encryption algorithm 0x%04x", cipher);
+                return -1;
+        }
+        if (cipher_is_gcm(cipher)) {
+                rc = gcm_decrypt(smb2->serverout_key, klen,
+                                 &hdr[20], &hdr[20], 32,
+                                 data, len, &hdr[4]);
+        } else {
+                rc = smb3_aes_ccm_decrypt(smb2->serverout_key, klen,
+                                          &hdr[20], 11, &hdr[20], 32,
+                                          data, len, &hdr[4], 16);
+        }
+        if (rc) {
                 smb2_set_error(smb2, "Failed to decrypt PDU");
                 return -1;
         }

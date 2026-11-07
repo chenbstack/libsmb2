@@ -102,6 +102,7 @@
 #include "libsmb2.h"
 #include "libsmb2-raw.h"
 #include "libsmb2-private.h"
+#include "smb3-seal.h"
 #include "smb2-signing.h"
 #include "portable-endian.h"
 #include "ntlmssp.h"
@@ -578,26 +579,31 @@ void smb2_derive_key(
     uint32_t    label_len,
     const char  *context,
     uint32_t    context_len,
-    uint8_t     derived_key[SMB2_KEY_SIZE]
+    uint8_t     *derived_key,
+    uint32_t    derived_key_len
     )
 {
         unsigned char nul = 0;
         const uint32_t counter = htobe32(1);
-        const uint32_t keylen = htobe32(SMB2_KEY_SIZE * 8);
-        uint8_t input_key[SMB2_KEY_SIZE] = {0};
+        const uint32_t keylen = htobe32(derived_key_len * 8);
+        /* velum: AES-256 用完整会话密钥（最多 32 字节），其余只用前 16 字节 */
+        uint8_t input_key[SMB2_CIPHER_KEY_MAX] = {0};
+        uint32_t input_len = derived_key_len > SMB2_KEY_SIZE ?
+                SMB2_CIPHER_KEY_MAX : SMB2_KEY_SIZE;
         HMACContext ctx;
         uint8_t digest[USHAMaxHashSize];
 
-        memcpy(input_key, derivation_key, MIN(sizeof(input_key),
+        memcpy(input_key, derivation_key, MIN(input_len,
                                               derivation_key_len));
-        hmacReset(&ctx, SHA256, input_key, sizeof(input_key));
+        /* velum: HMAC 会把短于分组的密钥补零，所以按补零后的 16 / 32 字节传入与按实际长度等价 */
+        hmacReset(&ctx, SHA256, input_key, input_len);
         hmacInput(&ctx, (unsigned char *)&counter, sizeof(counter));
         hmacInput(&ctx, (unsigned char *)label, label_len);
         hmacInput(&ctx, &nul, 1);
         hmacInput(&ctx, (unsigned char *)context, context_len);
         hmacInput(&ctx, (unsigned char *)&keylen, sizeof(keylen));
         hmacResult(&ctx, digest);
-        memcpy(derived_key, digest, SMB2_KEY_SIZE);
+        memcpy(derived_key, digest, derived_key_len);
 }
 
 /* MS-SMB2 3.2.5.2 */
@@ -627,6 +633,13 @@ smb3_update_preauth_hash(struct smb2_context *smb2, int niov,
 
 static void smb2_create_signing_key(struct smb2_context *smb2)
 {
+        /* velum: 3.0 / 3.0.2 固定 AES-128-CCM；算法不支持时先按 16 字节派生，封装时再报错 */
+        int klen = smb3_cipher_key_len(smb2->cypher ? smb2->cypher :
+                                       SMB2_ENCRYPTION_AES_128_CCM);
+        if (klen == 0) {
+                klen = SMB2_KEY_SIZE;
+        }
+
         /* Derive the signing key from session key
          * This is based on negotiated protocol
          */
@@ -643,21 +656,21 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 sizeof(SMB2AESCMAC),
                                 SmbSign,
                                 sizeof(SmbSign),
-                                smb2->signing_key);
+                                smb2->signing_key, SMB2_KEY_SIZE);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMB2AESCCM,
                                 sizeof(SMB2AESCCM),
                                 ServerIn,
                                 sizeof(ServerIn),
-                                smb2->serverin_key);
+                                smb2->serverin_key, klen);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMB2AESCCM,
                                 sizeof(SMB2AESCCM),
                                 ServerOut,
                                 sizeof(ServerOut),
-                                smb2->serverout_key);
+                                smb2->serverout_key, klen);
         } else if (smb2->dialect > SMB2_VERSION_0302) {
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
@@ -665,21 +678,21 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 sizeof(SMBSigningKey),
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
-                                smb2->signing_key);
+                                smb2->signing_key, SMB2_KEY_SIZE);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMBC2SCipherKey,
                                 sizeof(SMBC2SCipherKey),
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
-                                smb2->serverin_key);
+                                smb2->serverin_key, klen);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMBS2CCipherKey,
                                 sizeof(SMBS2CCipherKey),
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
-                                smb2->serverout_key);
+                                smb2->serverout_key, klen);
         }
 }
 
@@ -738,7 +751,11 @@ session_setup_cb(struct smb2_context *smb2, int status,
 #endif
 
 
-        if (smb2->sign || smb2->seal || smb2->dialect == SMB2_VERSION_0311) {
+        if (smb2->sign || smb2->seal || smb2->dialect == SMB2_VERSION_0311 ||
+            smb2->dialect == SMB2_VERSION_0300 || smb2->dialect == SMB2_VERSION_0302) {
+                /* velum: 3.0 / 3.0.2 下即使会话不加密也派生密钥：共享可能在树连接时才要求加密 */
+                int verify = smb2->sign || smb2->seal ||
+                             smb2->dialect == SMB2_VERSION_0311;
                 uint8_t zero_key[SMB2_KEY_SIZE] = {0};
                 int have_valid_session_key = 1;
 
@@ -772,7 +789,7 @@ session_setup_cb(struct smb2_context *smb2, int status,
 
                 smb2_create_signing_key(smb2);
 
-                if (smb2->hdr.flags & SMB2_FLAGS_SIGNED) {
+                if (verify && (smb2->hdr.flags & SMB2_FLAGS_SIGNED)) {
                         uint8_t signature[16] _U_;
 
                         memcpy(&signature[0], &smb2->in.iov[1].buf[48], 16);

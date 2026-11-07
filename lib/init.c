@@ -307,12 +307,19 @@ struct smb2_context *smb2_init_context(void)
         smb2->version = SMB2_VERSION_ANY;
         smb2->ndr = 1;
 
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        /* velum: 客户端挑战与 preauth salt 用密码学随机数 */
+        arc4random_buf(smb2->client_challenge, 8);
+        arc4random_buf(smb2->salt, SMB2_SALT_SIZE);
+        (void)i;
+#else
         for (i = 0; i < 8; i++) {
                 smb2->client_challenge[i] = random() & 0xff;
         }
         for (i = 0; i < SMB2_SALT_SIZE; i++) {
                 smb2->salt[i] = random() & 0xff;
         }
+#endif
 
         snprintf(smb2->client_guid, 16, "libsmb2-%d", (int)random());
 

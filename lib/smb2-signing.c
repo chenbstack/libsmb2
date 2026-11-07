@@ -63,6 +63,9 @@
 #define CBC 1
 
 #include "aes.h"
+#ifdef __APPLE__
+#include <CommonCrypto/CommonCrypto.h>
+#endif
 #include "sha.h"
 #include "sha-private.h"
 
@@ -140,6 +143,50 @@ void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
 
         aes_cmac_sub_keys(key, sub_key1, sub_key2);
 
+#ifdef __APPLE__
+        {
+                /*
+                 * velum: 前 n-1 块整段走 CommonCrypto 的 CBC（零 IV），最后一块异或子密钥后
+                 * 接着喂进同一个 cryptor，最后一块输出就是 MAC。避免每 16 字节建一次 cryptor。
+                 */
+                static const uint8_t zero_iv[AES_BLOCK_SIZE] = {0};
+                uint8_t out[4096];
+                const uint8_t *in = msg;
+                uint64_t left = (n - 1) * AES128_KEY_LEN;
+                size_t moved;
+                CCCryptorRef c = NULL;
+
+                if (is_last_block_complete) {
+                        memcpy(scratch, &msg[(n - 1) * AES128_KEY_LEN], AES128_KEY_LEN);
+                        aes_cmac_xor(scratch, sub_key1);
+                } else {
+                        memset(scratch, 0, AES128_KEY_LEN);
+                        memcpy(scratch, &msg[(n - 1) * AES128_KEY_LEN], (size_t)rem);
+                        scratch[rem] = 0x80;
+                        aes_cmac_xor(scratch, sub_key2);
+                }
+                memset(mac, 0, AES128_KEY_LEN);
+                if (CCCryptorCreateWithMode(kCCEncrypt, kCCModeCBC, kCCAlgorithmAES,
+                                            ccNoPadding, zero_iv, key, AES128_KEY_LEN,
+                                            NULL, 0, 0, 0, &c) != kCCSuccess) {
+                        return; /* MAC 全零，校验会失败 */
+                }
+                while (left) {
+                        size_t chunk = left > sizeof(out) ? sizeof(out) : (size_t)left;
+                        if (CCCryptorUpdate(c, in, chunk, out, sizeof(out), &moved) != kCCSuccess) {
+                                CCCryptorRelease(c);
+                                return;
+                        }
+                        in   += chunk;
+                        left -= chunk;
+                }
+                if (CCCryptorUpdate(c, scratch, AES128_KEY_LEN, mac, AES128_KEY_LEN, &moved) != kCCSuccess) {
+                        memset(mac, 0, AES128_KEY_LEN);
+                }
+                CCCryptorRelease(c);
+                (void)i;
+        }
+#else
         memset(mac, 0, AES128_KEY_LEN);
 
         for (i = 0; i < n - 1; i++) {
@@ -161,6 +208,7 @@ void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
         aes_cmac_xor(mac, scratch);
         AES128_ECB_encrypt(mac, key, scratch);
         memcpy(mac, scratch, AES128_KEY_LEN);
+#endif
 }
 
 int
